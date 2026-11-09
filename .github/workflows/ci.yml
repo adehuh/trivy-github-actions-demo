@@ -250,9 +250,14 @@ jobs:
           REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
           docker tag "app:${GITHUB_SHA}" "${REPO}:${GITHUB_SHA}"
           docker tag "app:${GITHUB_SHA}" "${REPO}:main"
-          docker push -q "${REPO}:${GITHUB_SHA}"
-          docker push -q "${REPO}:main"
-          REF=$(docker inspect --format '{{index .RepoDigests 0}}' "${REPO}:${GITHUB_SHA}")
+          # Retry: the very first push to a new GHCR package can be denied while
+          # the package <-> repo link is being created
+          push() { for i in 1 2 3; do docker push -q "$1" && return 0; echo "push retry $i"; sleep $((i*10)); done; return 1; }
+          push "${REPO}:${GITHUB_SHA}"
+          push "${REPO}:main"
+          # Pick the digest that belongs to the GHCR repo (not the local "app" tag)
+          REF=$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${REPO}:${GITHUB_SHA}" | grep "^${REPO}@sha256:" | head -1)
+          test -n "$REF"
           echo "[BUILD] Immutable reference: ${REF} (real registry digest)"
           echo "image_ref=${REF}" >> "$GITHUB_OUTPUT"
           echo "**Image:** \`${REF}\`" >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.tar
+trivy-*.json
+trivy-*.txt
+sbom*.json

@@ -1,0 +1,6 @@
+# Shared Trivy settings (picked up automatically from the repo root)
+db:
+  repository:
+    - mirror.gcr.io/aquasec/trivy-db
+    - ghcr.io/aquasecurity/trivy-db
+timeout: 10m

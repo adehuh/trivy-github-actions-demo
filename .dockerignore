@@ -1,0 +1,6 @@
+.git
+.github
+tests
+k8s
+*.tar
+*.json

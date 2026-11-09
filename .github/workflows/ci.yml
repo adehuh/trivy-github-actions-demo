@@ -1,0 +1,424 @@
+# GitHub Actions only (no GitLab). Same 21 jobs / needs / triggers as the PDF
+# "GitLab CI vs GitHub Actions", but the security jobs run REAL Trivy scans:
+#   secret_detection   -> trivy fs --scanners secret
+#   snyk_dependencies  -> trivy fs --scanners vuln      (SCA)
+#   iac_security       -> trivy config .                (Dockerfile + K8s)
+#   kubernetes_validation -> trivy config k8s/
+#   license_compliance -> trivy fs --scanners license
+#   build_image        -> real docker build, push to GHCR on main (real sha256 digest)
+#   snyk_container     -> trivy image                   (OS + language packages)
+#   sbom               -> trivy image --format cyclonedx
+#   nightly_regression -> nightly Trivy rescan for newly published CVEs
+# Deploy / E2E / DAST / Sonar / cosign jobs remain echo simulations as in the PDF.
+
+name: CI (Trivy)
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  schedule:
+    - cron: "0 2 * * *" # 02:00 UTC (= 09:00 WIB)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  TRIVY_VERSION: v0.76.2
+  # Gate policy: fail on HIGH/CRITICAL that already have a fix
+  GATE_SEVERITY: HIGH,CRITICAL
+
+jobs:
+  # ───────────────────────── 01-02 validate ─────────────────────────
+  validate_config:
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Validate config
+        run: |
+          echo "[VALIDATE] Check GitHub Actions YAML, Dockerfile, and configuration"
+          pip install -q pyyaml
+          python3 -c "import yaml,glob; [yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.yml')]" && echo "workflow YAML OK"
+          python3 -c "import yaml; list(yaml.safe_load_all(open('k8s/deployment.yaml')))" && echo "k8s YAML OK"
+          test -f Dockerfile && echo "Dockerfile present"
+
+  secret_detection:
+    name: secret_detection (Trivy)
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Trivy secret scan (BLOCK on leaked credentials)
+        run: |
+          echo "[SECRET] Check passwords, API keys, JWT tokens, private keys"
+          echo "[SECRET] BLOCK on confirmed leaked credentials"
+          echo "[SECRET] >>> running: trivy fs --scanners secret"
+          trivy fs --scanners secret --exit-code 1 --format table . | tee trivy-secret.txt
+      - name: Job summary
+        if: always()
+        run: |
+          { echo '### Trivy secret scan'; echo '```'; cat trivy-secret.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────── 03-04 test ─────────────────────────
+  unit_test:
+    needs: [validate_config, secret_detection]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Unit test
+        run: |
+          echo "[UNIT] P0 payment and stock calculation"
+          echo "[UNIT] P1 discount rules; P2 edge cases"
+          python -m unittest tests.test_unit -v
+          echo "[UNIT] Generate coverage for SonarQube (simulation)"
+
+  integration_test:
+    needs: [validate_config, secret_detection]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.13"
+      - name: Integration test (real HTTP server)
+        run: |
+          echo "[INTEGRATION] P0 auth, order/inventory, payment mock"
+          echo "[INTEGRATION] P1 product and profile database flows"
+          python -m unittest tests.test_integration -v
+
+  # ───────────────────────── 05-09 analyze ─────────────────────────
+  sonarqube:
+    needs: [unit_test, integration_test]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulated sonarqube
+        run: |
+          echo "[SONAR] Analyze bugs, code smells, hotspots, coverage"
+          echo "[SONAR] BLOCK if quality gate fails"
+
+  snyk_dependencies:
+    name: snyk_dependencies (Trivy SCA)
+    needs: [unit_test, integration_test]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Trivy dependency scan (BLOCK on policy-breaking CVEs)
+        run: |
+          echo "[SNYK SCA] Check dependencies, CVEs, OWASP vulnerable components"
+          echo "[SNYK SCA] BLOCK on policy-breaking findings"
+          echo "[SNYK SCA] >>> running: trivy fs --scanners vuln (Trivy replaces Snyk)"
+          trivy fs --scanners vuln --severity "$GATE_SEVERITY" --ignore-unfixed \
+            --exit-code 1 --format table . | tee trivy-deps.txt
+      - name: Job summary
+        if: always()
+        run: |
+          { echo '### Trivy dependency scan'; echo '```'; cat trivy-deps.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  iac_security:
+    name: iac_security (Trivy config)
+    needs: [unit_test, integration_test]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Trivy misconfiguration scan (Dockerfile, Kubernetes, Terraform)
+        run: |
+          echo "[IAC] Checkov/Trivy config checks for Terraform and Kubernetes"
+          echo "[IAC] >>> running: trivy config ."
+          trivy config --severity "$GATE_SEVERITY" --exit-code 1 --format table . | tee trivy-iac.txt
+      - name: Job summary
+        if: always()
+        run: |
+          { echo '### Trivy IaC scan'; echo '```'; cat trivy-iac.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  kubernetes_validation:
+    name: kubernetes_validation (Trivy)
+    needs: [unit_test, integration_test]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Trivy Kubernetes manifest policy check
+        run: |
+          echo "[K8S] kubeconform schema and Kyverno policy checks"
+          echo "[K8S] >>> running: trivy config k8s/ (Trivy KSV policies)"
+          # Full report (all severities) for visibility ...
+          trivy config --format table k8s/ | tee trivy-k8s.txt
+          # ... gate only on HIGH/CRITICAL
+          trivy config --severity "$GATE_SEVERITY" --exit-code 1 --quiet k8s/
+      - name: Job summary
+        if: always()
+        run: |
+          { echo '### Trivy Kubernetes scan'; echo '```'; cat trivy-k8s.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  license_compliance:
+    name: license_compliance (Trivy)
+    needs: [unit_test, integration_test]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Trivy license scan (BLOCK on forbidden/restricted licenses)
+        run: |
+          echo "[LICENSE] Check dependencies against license policy"
+          echo "[LICENSE] >>> running: trivy fs --scanners license"
+          trivy fs --scanners license --severity "$GATE_SEVERITY" --exit-code 1 --format table . | tee trivy-license.txt
+      - name: Job summary
+        if: always()
+        run: |
+          { echo '### Trivy license scan'; echo '```'; cat trivy-license.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────── 10 build ─────────────────────────
+  build_image:
+    needs: [sonarqube, snyk_dependencies, iac_security, kubernetes_validation, license_compliance]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io (only used on main)
+    outputs:
+      image_ref: ${{ steps.ref.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build one Docker image
+        run: |
+          echo "[BUILD] Compile application and build one Docker image"
+          echo "[BUILD] >>> running: docker build"
+          docker build \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -t "app:${GITHUB_SHA}" .
+          # Same image bytes are handed to scan/SBOM jobs, so we scan exactly what we ship
+          docker save -o image.tar "app:${GITHUB_SHA}"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image
+          path: image.tar
+          retention-days: 1
+      - name: Log in to GHCR
+        if: ${{ github.event_name != 'pull_request' }}
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Push and resolve immutable digest
+        id: ref
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+            # PRs never push; downstream jobs use the image.tar artifact
+            echo "image_ref=app:${GITHUB_SHA} (local, not pushed on PR)" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          REPO="ghcr.io/${GITHUB_REPOSITORY,,}"
+          docker tag "app:${GITHUB_SHA}" "${REPO}:${GITHUB_SHA}"
+          docker tag "app:${GITHUB_SHA}" "${REPO}:main"
+          docker push -q "${REPO}:${GITHUB_SHA}"
+          docker push -q "${REPO}:main"
+          REF=$(docker inspect --format '{{index .RepoDigests 0}}' "${REPO}:${GITHUB_SHA}")
+          echo "[BUILD] Immutable reference: ${REF} (real registry digest)"
+          echo "image_ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "**Image:** \`${REF}\`" >> "$GITHUB_STEP_SUMMARY"
+
+  # ───────────────────────── 11-13 supply_chain ─────────────────────────
+  snyk_container:
+    name: snyk_container (Trivy image)
+    needs: [build_image]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REF: ${{ needs.build_image.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (for trivy.yaml)
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Trivy image scan (OS packages + base image CVEs)
+        run: |
+          echo "[CONTAINER] Scan image OS packages and base image CVEs - $IMAGE_REF"
+          echo "[CONTAINER] >>> running: trivy image (Trivy replaces Snyk)"
+          trivy image --input image.tar --format table | tee trivy-image.txt
+          trivy image --input image.tar --severity "$GATE_SEVERITY" --ignore-unfixed --exit-code 1 --quiet
+      - name: Job summary
+        if: always()
+        run: |
+          { echo '### Trivy image scan'; echo "\`$IMAGE_REF\`"; echo '```'; cat trivy-image.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
+  sbom:
+    name: sbom (Trivy CycloneDX)
+    needs: [build_image]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: image
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Generate CycloneDX + SPDX bill of materials
+        run: |
+          echo "[SBOM] Generate CycloneDX/SPDX bill of materials"
+          echo "[SBOM] >>> running: trivy image --format cyclonedx / spdx-json"
+          trivy image --input image.tar --format cyclonedx --output sbom.cdx.json
+          trivy image --input image.tar --format spdx-json  --output sbom.spdx.json
+          echo "components: $(python3 -c "import json;print(len(json.load(open('sbom.cdx.json')).get('components',[])))")"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sbom
+          path: sbom.*.json
+
+  cosign:
+    needs: [build_image]
+    if: ${{ github.event_name != 'schedule' }}
+    runs-on: ubuntu-latest
+    env:
+      IMAGE_REF: ${{ needs.build_image.outputs.image_ref }}
+    steps:
+      - name: Simulated cosign
+        run: echo "[SIGN] Sign and attest image - $IMAGE_REF"
+
+  # ───────────────────────── 14 staging (push main only) ─────────────────────────
+  staging_deploy:
+    needs: [snyk_container, sbom, cosign, build_image]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      IMAGE_REF: ${{ needs.build_image.outputs.image_ref }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Simulated staging deploy
+        run: |
+          echo "[STAGING] Deploy EXACT image $IMAGE_REF via Argo CD (simulation)"
+          # Render the manifest that would be committed to the GitOps repo
+          sed "s|image: .*|image: ${IMAGE_REF}|" k8s/deployment.yaml | grep -n "image:"
+
+  # ───────────────────────── 15-17 e2e / dast ─────────────────────────
+  e2e_p0:
+    needs: [staging_deploy]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulated e2e p0
+        run: |
+          echo "[E2E P0] Login, cart, checkout, sandbox payment, inventory"
+          echo "[E2E P0] Blocking critical flow tests"
+
+  e2e_p1:
+    needs: [e2e_p0]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    continue-on-error: true # GitLab allow_failure: true
+    steps:
+      - name: Simulated e2e p1
+        run: |
+          echo "[E2E P1] Search, filters, profile, order history"
+          echo "[E2E P1] Non-blocking by example policy; QA review required"
+
+  dast_zap:
+    needs: [e2e_p1]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulated dast zap
+        run: |
+          echo "[DAST] OWASP ZAP baseline scan on authorized staging"
+          echo "[DAST] BLOCK on policy-breaking security findings"
+
+  # ───────────────────────── 18-20 production ─────────────────────────
+  production_deploy:
+    needs: [dast_zap, build_image]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    # Manual approval = Settings > Environments > production > Required reviewers
+    environment: production
+    env:
+      IMAGE_REF: ${{ needs.build_image.outputs.image_ref }}
+    steps:
+      - name: Simulated production deploy
+        run: |
+          echo "[PROD] Production environment approval granted (if configured)"
+          echo "[PROD] Promote EXACT image $IMAGE_REF; no rebuild"
+
+  production_smoke:
+    needs: [production_deploy]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulated production smoke
+        run: |
+          echo "[SMOKE] GET readiness, products, inventory"
+          echo "[SMOKE] Test account auth and 401/403 authorization"
+          echo "[SMOKE] Payment service health; no real charges"
+
+  production_monitor:
+    needs: [production_smoke]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Simulated production monitor
+        run: |
+          echo "[MONITOR] Check 5xx error rate, p95 latency, availability"
+          echo "[MONITOR] Alert and evaluate rollback if regression occurs"
+
+  # ───────────────────────── 21 nightly (schedule only) ─────────────────────────
+  nightly_regression:
+    if: ${{ github.event_name == 'schedule' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aquasecurity/setup-trivy@81e514348e19b6112ce2a7e3ecbafe19c1e1f567 # v0.3.1
+        with:
+          version: ${{ env.TRIVY_VERSION }}
+          cache: true
+      - name: Nightly regression + Trivy rescan (new CVEs appear daily)
+        run: |
+          echo "[NIGHTLY] Run full P0 + P1 + P2 regression on isolated staging/test environment"
+          echo "[NIGHTLY] >>> running: unit/integration tests + trivy image rescan"
+          python3 -m unittest discover -s tests -t . -v
+          docker build -q -t app:nightly .
+          trivy image --severity "$GATE_SEVERITY" --ignore-unfixed --exit-code 1 --format table app:nightly

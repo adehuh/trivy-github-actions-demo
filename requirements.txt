@@ -1,0 +1,2 @@
+# App uses the Python standard library only. Add pinned deps here;
+# Trivy (job: dependency_scan) scans this file for CVEs.

@@ -29,3 +29,10 @@ python -m unittest discover -s tests -t .
 docker build -t app . && trivy image --severity HIGH,CRITICAL --ignore-unfixed app
 trivy config . && trivy fs --scanners secret,vuln,license .
 ```
+
+## Terraform examples (CIDR)
+- `examples/terraform/pass` — security group limited to `10.0.0.0/16` → passes Trivy.
+- `examples/terraform/fail` — `0.0.0.0/0` / `::/0` → blocked (AWS-0107, AWS-0104). Skipped by the gate; a CI *policy self-test* requires Trivy to block it.
+- Terraform is scanned statically only — never applied (no cloud credentials).
+
+Live-demo guide: [steps.md](steps.md)

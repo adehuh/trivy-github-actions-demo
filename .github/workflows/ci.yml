@@ -25,8 +25,17 @@ on:
 permissions:
   contents: read
 
+# IMPORTANT: explicit `shell: bash` = `bash -eo pipefail`. Without it GitHub uses
+# `bash -e` and `trivy ... | tee file` would return tee's exit code (0),
+# so a failing Trivy gate would NOT fail the job.
+defaults:
+  run:
+    shell: bash
+
+# PRs: a new push cancels the older PR run. main: every run is independent, so
+# a run waiting for production approval never blocks the next push.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -150,15 +159,33 @@ jobs:
         with:
           version: ${{ env.TRIVY_VERSION }}
           cache: true
+      # Terraform is NOT executed here: no `terraform init/plan/apply` and no AWS
+      # credentials. Trivy only reads the *.tf files statically (e.g. it checks
+      # security-group cidr_blocks for 0.0.0.0/0 or ::/0).
+      # examples/terraform/fail is intentionally insecure, so it is skipped by the
+      # gate and checked by the "policy self-test" step below instead.
       - name: Trivy misconfiguration scan (Dockerfile, Kubernetes, Terraform)
         run: |
           echo "[IAC] Checkov/Trivy config checks for Terraform and Kubernetes"
-          echo "[IAC] >>> running: trivy config ."
-          trivy config --severity "$GATE_SEVERITY" --exit-code 1 --format table . | tee trivy-iac.txt
+          echo "[IAC] Terraform is scanned statically only (not applied - no cloud credentials)"
+          echo "[IAC] >>> running: trivy config . (skip examples/terraform/fail)"
+          trivy config --severity "$GATE_SEVERITY" --exit-code 1 --format table \
+            --skip-dirs examples/terraform/fail . | tee trivy-iac.txt
+      - name: Policy self-test (insecure Terraform MUST be blocked)
+        run: |
+          echo "[IAC] >>> running: trivy config examples/terraform/fail (expect exit 1)"
+          if trivy config --severity "$GATE_SEVERITY" --exit-code 1 --format table examples/terraform/fail | tee trivy-iac-fail.txt; then
+            echo "::error::Gate is broken: 0.0.0.0/0 security group was NOT blocked"
+            exit 1
+          fi
+          echo "[IAC] OK: open CIDR (0.0.0.0/0, ::/0) was blocked by Trivy as expected"
       - name: Job summary
         if: always()
         run: |
-          { echo '### Trivy IaC scan'; echo '```'; cat trivy-iac.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '### Trivy IaC scan (gate)'; echo '```'; cat trivy-iac.txt; echo '```'
+            echo '### Policy self-test: examples/terraform/fail (expected to be blocked)'; echo '```'; cat trivy-iac-fail.txt 2>/dev/null; echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   kubernetes_validation:
     name: kubernetes_validation (Trivy)
